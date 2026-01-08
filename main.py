@@ -180,7 +180,6 @@ MESSAGES (natural, friendly):
 - Missing id+name: "What's your employee ID and name?"
 - Missing id: "Thanks! What's your employee ID?"
 - Missing name: "And what's your name?"
-- Missing dates: "When would you like to take leave?"
 - Missing start: "What's the start date?"
 - Missing end: "And the end date (or how many days)?"
 - Missing leave_type: "What's the reason for your leave?"
@@ -421,6 +420,7 @@ if __name__ == "__main__":
     print("Type 'exit' to quit.\n")
     
     conversation_context = {"active_flow": None}
+    print("Welcome to Edra HR Assistant, You can ask me Policy Queries, Leave Applications, or Directly write your Feedback")
     
     while True:
         try:
