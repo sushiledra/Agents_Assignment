@@ -144,37 +144,51 @@ Return JSON:
 }}
 
 EXTRACTION:
-- employee_id: any 3+ digits
-- employee_name: "I am/my name is X"
+- employee_id: any 3+ digits → extract as string
+- employee_name: "I am/my name is X" or just a name
 - leave_type: INFER from comments/message
   * sick/ill/doctor/medical → "sick"
-  * family/vacation/trip/holiday → "vacation"
+  * family/vacation/trip/holiday/eid → "vacation"
   * personal/urgent/emergency/wedding → "casual"
   * default → "vacation"
-- dates: "from X", "to X", "9 Jan", "2025-01-09"
+- dates: Parse flexibly:
+  * "tomorrow" → calculate from today
+  * "8 Jan 2026", "Jan 8", "2026-01-08" → parse to YYYY-MM-DD
+  * "from X to Y" → extract both dates
+  * Relative: "next Monday", "in 3 days"
 - duration: "X days" (calculate end_date if start_date exists)
 - comments: reason/explanation
 
 AUTO-CALCULATE:
 - start_date + number_of_days → end_date
 - start_date + end_date → number_of_days
+- If only start_date provided, default to 1 day
 
 PRESERVE EXISTING:
 - Keep all non-null values from current_state
 - Only update with new information from message
+- NEVER reset a field that was already set
+
+DATE PARSING EXAMPLES:
+- "tomorrow" → {datetime.now() + timedelta(days=1):%Y-%m-%d}
+- "8 Jan 2026" → "2026-01-08"
+- "Jan 8" → assume current year
+- "in 2 days" → calculate from today
 
 MESSAGES (natural, friendly):
-- Missing Everything: "Please provide us a brief detail about your Leave."
+- Missing Everything: "I can help you apply for leave! Could you tell me your employee ID and name?"
 - Missing id+name: "What's your employee ID and name?"
 - Missing id: "Thanks! What's your employee ID?"
-- Missing dates: "When do you need leave?"
-- Missing start: "When does it start?"
-- Missing end: "When does it end or how many days?"
+- Missing name: "And what's your name?"
+- Missing dates: "When would you like to take leave?"
+- Missing start: "What's the start date?"
+- Missing end: "And the end date (or how many days)?"
+- Missing leave_type: "What's the reason for your leave?"
 
 REQUIRED: employee_id, employee_name, leave_type, start_date, end_date, number_of_days
 All present → "complete", else → "missing"
 
-If leave_type unclear, ask: "What's the reason for your leave?" to infer type from response.
+IMPORTANT: If you receive a date in ANY format, convert it to YYYY-MM-DD and update start_date immediately.
 """
 
     try:
@@ -182,7 +196,7 @@ If leave_type unclear, ask: "What's the reason for your leave?" to infer type fr
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"State: {json.dumps(current_state)}\nMessage: {message}"}
+                {"role": "user", "content": f"Current State: {json.dumps(current_state)}\n\nNew Message: {message}"}
             ],
             response_format={"type": "json_object"},
             temperature=0.3
@@ -190,33 +204,44 @@ If leave_type unclear, ask: "What's the reason for your leave?" to infer type fr
         
         data = json.loads(response.choices[0].message.content)
         
+        
         if "updated_state" not in data:
-            return {
-                "status": "missing",
-                "updated_state": current_state,
-                "message": "Please provide us a brief detail about your Leave.",
-                "leave_data": None
-            }
+            data["updated_state"] = current_state.copy()
+        else:
+            merged = current_state.copy()
+            for key, value in data["updated_state"].items():
+                if value is not None:
+                    merged[key] = value
+            data["updated_state"] = merged
         
         required = ["employee_id", "employee_name", "leave_type", "start_date", "end_date", "number_of_days"]
         updated = data["updated_state"]
         
-        if data["status"] == "complete" and all(updated.get(f) for f in required):
+        is_complete = all(updated.get(f) for f in required)
+        
+        if is_complete:
+            data["status"] = "complete"
             data["leave_data"] = {
-                k: str(updated[k]) if k != "number_of_days" else int(updated[k]) 
-                for k in required + ["comments"]
+                "employee_id": str(updated["employee_id"]),
+                "employee_name": str(updated["employee_name"]),
+                "leave_type": str(updated["leave_type"]),
+                "start_date": str(updated["start_date"]),
+                "end_date": str(updated["end_date"]),
+                "number_of_days": int(updated["number_of_days"]),
+                "comments": str(updated.get("comments", ""))
             }
         else:
+            data["status"] = "missing"
             data["leave_data"] = None
         
         return data
         
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"[ERROR] leave_agent exception: {e}")
         return {
             "status": "missing",
             "updated_state": current_state,
-            "message": "Could you repeat that?",
+            "message": "Sorry, I didn't catch that. Could you repeat?",
             "leave_data": None
         }
 
