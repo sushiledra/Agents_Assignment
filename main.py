@@ -122,7 +122,8 @@ def policy_chat(question):
                     "content": f"Context:\n{context}\n\nQuestion:\n{question}"
                 }
             ],
-            temperature=0
+            temperature=0,
+            max_tokens=2000
         )
         return res.choices[0].message.content
     except Exception as e:
@@ -130,117 +131,106 @@ def policy_chat(question):
         return "I encountered an error processing your policy question. Please try again."
 
 def leave_agent(message, current_state):
-    system_prompt = f"""
-HR leave assistant. Today: {datetime.now().strftime('%Y-%m-%d')}
+    today = datetime.now().strftime("%Y-%m-%d")
+    tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+    day_after_tomorrow = (datetime.now() + timedelta(days=2)).strftime("%Y-%m-%d")
 
-Extract info from message and current_state. Preserve existing values.
+    system_prompt = f"""Extract leave information and merge with existing state. Today: {today}
 
-Return JSON:
+CURRENT STATE (preserve non-null values):
+{json.dumps(current_state)}
+
+EXTRACTION RULES:
+1. Extract & merge new info with current state - PRESERVE existing non-null values
+2. employee_id: any 3+ digit number
+3. employee_name: extract any name mentioned
+4. leave_type: "sick"/"casual"/"vacation" - infer if unclear or not mentioned as casual
+5. start_date: Parse dates to YYYY-MM-DD format. IMPORTANT date parsing rules:
+   - Explicit dates: "Jan 8", "8th Jan", "2026-01-15" → YYYY-MM-DD
+   - Standalone "today" or "from today" → {today}
+   - Standalone "tomorrow" → {tomorrow}
+   - "day after tomorrow" → {day_after_tomorrow}
+   - If current state is missing start_date and user just says "today"/"tomorrow", treat it as the start_date
+   - Never leave start date as null aslways ask it from the user
+   - DO NOT assume or infer start_date from context - it must be explicitly stated by the user 
+6. number_of_days: extract from "3 days", "for 5 days", "three", etc.
+7. comments: optional additional context
+
+AUTO-CALCULATION (apply after extraction):
+- Have start_date + number_of_days? → Calculate end_date = start_date + (number_of_days - 1)
+- Have start_date + end_date? → Calculate number_of_days = (end_date - start_date) + 1
+- Missing both end_date AND number_of_days? → Ask user for either end_date or number_of_days
+
+IMPORTANT: Return the output as a JSON object with the following format:
 {{
-    "status": "missing|complete",
-    "updated_state": {{"employee_id": null, "employee_name": null, "leave_type": null, "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD", "number_of_days": int, "comments": ""}},
-    "message": "conversational response",
-    "leave_data": {{all fields or null}}
+  "employee_id": "string or null",
+  "employee_name": "string or null",
+  "leave_type": "sick|casual|vacation or null",
+  "start_date": "YYYY-MM-DD or null",
+  "end_date": "YYYY-MM-DD or null",
+  "number_of_days": number or null,
+  "comments": "string or null"
 }}
 
-EXTRACTION:
-- employee_id: any 3+ digits → extract as string
-- employee_name: "I am/my name is X" or just a name
-- leave_type: INFER from comments/message
-  * sick/ill/doctor/medical → "sick"
-  * family/vacation/trip/holiday/eid → "vacation"
-  * personal/urgent/emergency/wedding → "casual"
-  * default → "vacation"
-- dates: Parse flexibly:
-  * "tomorrow" → calculate from today
-  * "8 Jan 2026", "Jan 8", "2026-01-08" → parse to YYYY-MM-DD
-  * "from X to Y" → extract both dates
-  * Relative: "next Monday", "in 3 days"
-- duration: "X days" (calculate end_date if start_date exists)
-- comments: reason/explanation
-
-AUTO-CALCULATE:
-- start_date + number_of_days → end_date
-- start_date + end_date → number_of_days
-- If only start_date provided, default to 1 day
-
-PRESERVE EXISTING:
-- Keep all non-null values from current_state
-- Only update with new information from message
-- NEVER reset a field that was already set
-
-DATE PARSING EXAMPLES:
-- "tomorrow" → {datetime.now() + timedelta(days=1):%Y-%m-%d}
-- "8 Jan 2026" → "2026-01-08"
-- "Jan 8" → assume current year
-- "in 2 days" → calculate from today
-
-MESSAGES (natural, friendly):
-- Missing Everything: "I can help you apply for leave! Could you tell me your employee ID and name?"
-- Missing id+name: "What's your employee ID and name?"
-- Missing id: "Thanks! What's your employee ID?"
-- Missing name: "And what's your name?"
-- Missing start: "What's the start date?"
-- Missing end: "And the end date (or how many days)?"
-- Missing leave_type: "What's the reason for your leave?"
-
-REQUIRED: employee_id, employee_name, leave_type, start_date, end_date, number_of_days
-All present → "complete", else → "missing"
-
-IMPORTANT: If you receive a date in ANY format, convert it to YYYY-MM-DD and update start_date immediately.
-"""
+Return COMPLETE merged state (current + new) as JSON."""
 
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Current State: {json.dumps(current_state)}\n\nNew Message: {message}"}
+                {"role": "user", "content": message}
             ],
             response_format={"type": "json_object"},
-            temperature=0.3
+            temperature=0.2,
+            max_tokens=1000
         )
-        
-        data = json.loads(response.choices[0].message.content)
-        
-        
-        if "updated_state" not in data:
-            data["updated_state"] = current_state.copy()
-        else:
-            merged = current_state.copy()
-            for key, value in data["updated_state"].items():
-                if value is not None:
-                    merged[key] = value
-            data["updated_state"] = merged
-        
-        required = ["employee_id", "employee_name", "leave_type", "start_date", "end_date", "number_of_days"]
-        updated = data["updated_state"]
-        
-        is_complete = all(updated.get(f) for f in required)
-        
-        if is_complete:
-            data["status"] = "complete"
-            data["leave_data"] = {
-                "employee_id": str(updated["employee_id"]),
-                "employee_name": str(updated["employee_name"]),
-                "leave_type": str(updated["leave_type"]),
-                "start_date": str(updated["start_date"]),
-                "end_date": str(updated["end_date"]),
-                "number_of_days": int(updated["number_of_days"]),
-                "comments": str(updated.get("comments", ""))
+
+        details = json.loads(response.choices[0].message.content)
+
+        missing_fields = []
+        if not details.get('employee_id'):
+            missing_fields.append('employee ID')
+        if not details.get('employee_name'):
+            missing_fields.append('employee name')
+        if not details.get('leave_type'):
+            missing_fields.append('leave type (sick/casual/vacation)')
+        if not details.get('start_date'):
+            missing_fields.append('start date')
+
+        # Check if EITHER end_date OR number_of_days is provided (not both required)
+        if not details.get('end_date') and not details.get('number_of_days'):
+            missing_fields.append('either end date or number of days')
+
+        if missing_fields:
+            return {
+                "status": "missing",
+                "updated_state": details,
+                "message": "I need more information. Please provide:\n- " + "\n- ".join(missing_fields),
+                "leave_data": None
             }
-        else:
-            data["status"] = "missing"
-            data["leave_data"] = None
-        
-        return data
-        
+
+        return {
+            "status": "complete",
+            "updated_state": details,
+            "message": "Leave request ready to submit!",
+            "leave_data": {
+                "employee_id": str(details['employee_id']),
+                "employee_name": str(details['employee_name']),
+                "leave_type": str(details['leave_type']),
+                "start_date": str(details['start_date']),
+                "end_date": str(details['end_date']),
+                "number_of_days": int(details['number_of_days']),
+                "comments": str(details.get('comments', ''))
+            }
+        }
+
     except Exception as e:
         print(f"[ERROR] leave_agent exception: {e}")
         return {
             "status": "missing",
             "updated_state": current_state,
-            "message": "Sorry, I didn't catch that. Could you repeat?",
+            "message": "Sorry, I didn't understand. Could you please repeat?",
             "leave_data": None
         }
 
@@ -265,56 +255,20 @@ def submit_leave(data):
 
 def feedback_agent(message):
     system_prompt = """
-You are a feedback processing assistant. Extract and structure user feedback into actionable insights.
+Extract feedback to JSON: {{"feedback": "string", "sentiment": "Positive|Neutral|Negative", "action_items": "string"}}
 
-Return ONLY valid JSON with these exact fields:
-{
-    "feedback": "the user's complete feedback as a single string",
-    "sentiment": "Positive, Neutral, or Negative",
-    "action_items": "brief summary of actions needed as a single string"
-}
+Sentiment: Positive (praise/satisfaction), Negative (complaints/problems), Neutral (suggestions/observations)
 
-SENTIMENT CLASSIFICATION:
-- Positive: praise, appreciation, satisfaction (e.g., "good", "love", "great", "excellent")
-- Negative: complaints, dissatisfaction, problems (e.g., "don't like", "bad", "poor", "issues")
-- Neutral: suggestions, observations, questions without strong emotion
+Actions:
+- Positive: "Continue [practice]" or "Maintain [what works]"
+- Negative dissatisfaction: "Investigate/address [issue]" or "Survey [topic]"
+- Negative lack: "Increase/expand [resource]"
+- Negative quality: "Review/enhance [service]"
+- Neutral: "Consider/evaluate [suggestion]"
+- Vague: "Seek clarification"
+- None: "Monitor patterns"
 
-ACTION ITEM INFERENCE GUIDE:
-
-For POSITIVE feedback:
-- Pattern: User expresses satisfaction with something
-- Action: "Continue [current practice]" or "Maintain [what's working]"
-- Example: "breakfast is early" → "Continue scheduling breakfast at the current early time"
-
-For NEGATIVE feedback (complaints/problems):
-- Pattern: User dislikes something specific
-- Action: "Investigate and address [specific issue]" or "Conduct survey on [topic]"
-- Example: "don't like the food" → "Conduct a survey to gather specific feedback on food preferences"
-
-- Pattern: User mentions lack/insufficiency
-- Action: "Increase [what's lacking]" or "Expand [limited resource]"
-- Example: "no multiple options" → "Increase the variety of breakfast options available"
-
-- Pattern: User reports quality issues
-- Action: "Improve quality of [item]" or "Review and enhance [service]"
-- Example: "food is cold" → "Review food temperature management and serving procedures"
-
-For NEUTRAL feedback (suggestions):
-- Pattern: User proposes ideas without complaint
-- Action: "Consider [suggestion]" or "Evaluate feasibility of [idea]"
-- Example: "add tea option" → "Consider adding tea to the beverage menu"
-
-GENERAL RULES:
-- Be specific and actionable (avoid vague responses like "address feedback")
-- Match action urgency to sentiment intensity
-- If feedback is too vague: "Seek clarification on specific concerns"
-- If no clear action needed: "Acknowledge and monitor for patterns"
-- Keep action_items concise (1-2 sentences max)
-
-FIELD REQUIREMENTS:
-- feedback: single string capturing complete user input
-- sentiment: exactly one word from [Positive, Neutral, Negative]
-- action_items: single string (not a list), specific and actionable
+Keep actions specific, concise (1-2 sentences).
 """
     try:
         response = client.chat.completions.create(
@@ -324,7 +278,8 @@ FIELD REQUIREMENTS:
                 {"role": "user", "content": message}
             ],
             response_format={"type": "json_object"},
-            temperature=0
+            temperature=0,
+            max_tokens=1500
         )
         
         data = json.loads(response.choices[0].message.content)
@@ -428,7 +383,7 @@ if __name__ == "__main__":
             
             if not user_input:
                 continue
-                
+            
             if user_input.lower() in ["exit", "quit", "bye"]:
                 print("Goodbye!")
                 break
